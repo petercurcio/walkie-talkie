@@ -19,11 +19,25 @@
 # enforce singletons - that is machine-wide and kills every other agent's
 # listener on a shared hub.
 #
-# Exit discipline: radio-wait.sh returns 0 on a received message (we append and
-# keep looping) and non-zero on kill / connection error / 401 stale-token. On
-# non-zero we STOP rather than relaunch - relaunching a dead token is exactly
-# what caused the rejoin/401 churn. We leave a RADIO_DOWN marker in the inbox so
-# the agent knows to re-fetch its token (radio_token) and restart.
+# Exit discipline: radio-wait.sh prints RADIO_KILLED + exits non-zero on a 401 /
+# explicit kill (token genuinely gone), and exits non-zero with EMPTY stdout on a
+# connection outage (hub unreachable - laptop asleep/offline, network change).
+# We treat those two differently:
+#   - 401 / RADIO_KILLED  -> token is dead; stop and leave a RADIO_DOWN marker so
+#                            the agent re-fetches its token (radio_token) + restarts.
+#   - connection outage    -> the token is STILL VALID (as long as the hub's
+#                            stale-grace outlives the outage); do NOT give up. Back
+#                            off and keep retrying the SAME token so a single
+#                            listener rides out a multi-hour laptop sleep instead of
+#                            dying and needing a manual restart. Re-registering here
+#                            would be wrong: it desyncs the shell's token from the
+#                            MCP server's, breaking sends/re-join. Token survival is
+#                            the hub-side fix (configurable STALE_GRACE_MS); this
+#                            side just has to not quit on a transient outage.
+#
+# Backoff is env-tunable (RADIO_BACKOFF_MIN / RADIO_BACKOFF_MAX, seconds) so tests
+# can run it fast and operators can adjust it.
+# The wait binary is RADIO_WAIT_BIN if set (test seam), else sibling radio-wait.sh.
 
 set -u
 
@@ -38,11 +52,16 @@ if [ -z "$HUB" ] || [ -z "$TOKEN" ] || [ -z "$INBOX" ]; then
   exit 1
 fi
 
-WAIT="$(cd "$(dirname "$0")" && pwd)/radio-wait.sh"
+WAIT="${RADIO_WAIT_BIN:-$(cd "$(dirname "$0")" && pwd)/radio-wait.sh}"
 if [ ! -x "$WAIT" ]; then
   echo "radio-listen.sh: radio-wait.sh not found/executable at $WAIT" >&2
   exit 1
 fi
+
+# Reconnect backoff after a connection outage (env-tunable; resets on a healthy poll).
+BACKOFF_MIN="${RADIO_BACKOFF_MIN:-5}"
+BACKOFF_MAX="${RADIO_BACKOFF_MAX:-120}"
+backoff="$BACKOFF_MIN"
 
 # Per-agent singleton guard (scoped via pidfile, never pkill-by-name).
 if [ -n "$PIDFILE" ]; then
@@ -68,28 +87,43 @@ fi
 while true; do
   out=$("$WAIT" "$HUB" "$TOKEN")
   rc=$?
+
+  # Genuine token death (401 / explicit kill): radio-wait prints RADIO_KILLED.
+  # The token is gone - stop and signal so the agent re-fetches it and restarts.
   if [ "$out" = "RADIO_KILLED" ]; then
     printf 'RADIO_DOWN: token rejected (401) or killed - re-fetch token and restart\n' >> "$INBOX"
     break
   fi
+
   if [ -n "$out" ]; then
     printf '%s\n' "$out" >> "$INBOX"
+    backoff="$BACKOFF_MIN"   # healthy poll - reset the outage backoff
     # Immediate wake when a captured line is addressed to this agent (or @all).
     # Exiting 0 completes the background task, which wakes the agent right away -
     # even from full idle. Fleet cross-talk falls through and keeps polling.
     if [ -n "$HANDLE" ] && printf '%s\n' "$out" | grep -qE -- "-> (${HANDLE}|@all):"; then
       exit 0
     fi
+    continue
   fi
+
+  # 143 (TERM) / 130 (INT) = the radio-wait child was killed by signal - e.g. the
+  # singleton guard replacing this listener, or radio_out. Intentional, not a
+  # failure, so exit quietly WITHOUT a RADIO_DOWN marker. (sleep below is
+  # interruptible by these signals, so the singleton guard still works promptly.)
+  if [ "$rc" -eq 143 ] || [ "$rc" -eq 130 ]; then
+    exit 0
+  fi
+
   if [ "$rc" -ne 0 ]; then
-    # 143 (TERM) / 130 (INT) = the radio-wait child was killed by signal - e.g.
-    # the singleton guard replacing this listener, or radio_out. That's
-    # intentional, not a failure, so exit quietly WITHOUT a RADIO_DOWN marker
-    # (those should only signal genuine token-death or connection failure).
-    if [ "$rc" -eq 143 ] || [ "$rc" -eq 130 ]; then
-      exit 0
-    fi
-    printf 'RADIO_DOWN: listener exited (rc=%s) - re-fetch token and restart\n' "$rc" >> "$INBOX"
-    break
+    # Connection outage (empty stdout + non-zero rc): hub unreachable. Do NOT
+    # quit - the token survives the outage (hub stale-grace permitting), and a
+    # 401 would have surfaced as RADIO_KILLED above. Back off and keep retrying
+    # the SAME token so one listener rides out a laptop sleep, then resumes.
+    sleep "$backoff"
+    backoff=$((backoff * 2))
+    [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff="$BACKOFF_MAX"
+    continue
   fi
+  # rc==0 with empty out: nothing delivered, no error - just re-poll.
 done
