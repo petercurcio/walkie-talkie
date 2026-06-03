@@ -636,16 +636,49 @@ function authenticateBearer(req: IncomingMessage, expected: string): boolean {
   return scheme === "Bearer" && token === expected;
 }
 
-const STALE_GRACE_MS = 30_000; // 30 seconds before auto-unregister
+const DEFAULT_STALE_GRACE_MS = 30_000; // 30 seconds before auto-unregister
 const staleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/**
+ * How long a poll-disconnected agent keeps its registration before the hub
+ * auto-unregisters it (invalidating its token). Configurable via
+ * WALKIE_TALKIE_STALE_GRACE_MS (milliseconds); defaults to 30s to preserve
+ * the existing behavior. A value <= 0 DISABLES auto-unregister entirely. The
+ * agent is marked offline but keeps its registration/token until an explicit
+ * unregister/kick.
+ *
+ * Why configurable: the default 30s is far shorter than a laptop sleep. When the
+ * hub runs on a laptop that sleeps overnight, every agent's poll connection drops
+ * and 30s later its token is auto-unregistered, so on wake the saved token is
+ * dead (401) and the agent can't resume without re-registering. Sleep-prone hosts
+ * should set this high (e.g. 86400000 = 24h) or 0 to disable, so a token survives
+ * the outage and the agent resumes on the same token. Invalid values fall back to
+ * the default.
+ */
+export function resolveStaleGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.WALKIE_TALKIE_STALE_GRACE_MS;
+  if (raw === undefined || raw === "") return DEFAULT_STALE_GRACE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : DEFAULT_STALE_GRACE_MS;
+}
+
 export function createHubServer(port: number, adminToken: string, joinToken: string): import("node:http").Server {
+  const staleGraceMs = resolveStaleGraceMs();
+
   // When a poll connection drops unexpectedly, mark user offline and start grace timer
   onPollDisconnect((userName) => {
     if (!isUserRegistered(userName)) return;
     setOffline(userName);
     broadcast({ type: "status", name: userName, online: false, timestamp: Date.now() });
-    console.log(`[offline] ${userName} (grace period ${STALE_GRACE_MS / 1000}s)`);
+
+    // Grace <= 0 disables auto-unregister: stay registered (token survives) while
+    // offline, until an explicit unregister/kick. This is what lets an agent ride
+    // out a long laptop sleep and resume on the same token.
+    if (staleGraceMs <= 0) {
+      console.log(`[offline] ${userName} (auto-unregister disabled)`);
+      return;
+    }
+    console.log(`[offline] ${userName} (grace period ${staleGraceMs / 1000}s)`);
 
     // Clear any existing grace timer
     const existing = staleTimers.get(userName);
@@ -667,7 +700,7 @@ export function createHubServer(port: number, adminToken: string, joinToken: str
           }
           console.log(`[auto-unregister] ${userName} (stale)`);
         }
-      }, STALE_GRACE_MS),
+      }, staleGraceMs),
     );
   });
 
