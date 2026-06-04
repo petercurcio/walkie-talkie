@@ -129,7 +129,23 @@ export class HubClient {
     return res.data;
   }
 
-  async poll(token: string): Promise<{
+  /**
+   * Bounded long-poll for radio_standby. timeoutMs MUST stay well under the MCP
+   * client's tool-call timeout: this runs as an MCP tool, and if the call blocks
+   * longer than that timeout the whole MCP server is dropped as unresponsive
+   * ("No such tool available"). The hub holds /poll open for up to an hour, so a
+   * too-long value here meant radio_standby could hang ~an hour and take the MCP
+   * connection down with it. 30s matches the tool's documented "blocks up to 30
+   * seconds" and stays under the default 60s MCP timeout.
+   *
+   * A timeout with no message is the NORMAL "no messages" outcome, not an error,
+   * so we resolve it to null (radio_standby then reports "no new messages")
+   * rather than throwing — throwing would surface as a tool error / dropped call.
+   */
+  async poll(
+    token: string,
+    timeoutMs = 30_000,
+  ): Promise<{
     messages: Array<{
       id: string;
       from: string;
@@ -140,27 +156,32 @@ export class HubClient {
       image?: { data: string; mimeType: string };
     }>;
   } | null> {
-    const res = await this.request<{
-      messages: Array<{
-        id: string;
-        from: string;
-        to: string;
-        content: string;
-        channel: string;
-        timestamp: number;
-        image?: { data: string; mimeType: string };
-      }>;
-    }>({
-      method: "GET",
-      path: "/poll",
-      token,
-      timeoutMs: 3_660_000, // 1 hour + 60s margin
-    });
-    if (res.status === 204) return null;
-    if (res.status !== 200) {
-      throw new Error((res.data as { error?: string }).error ?? "Poll failed");
+    try {
+      const res = await this.request<{
+        messages: Array<{
+          id: string;
+          from: string;
+          to: string;
+          content: string;
+          channel: string;
+          timestamp: number;
+          image?: { data: string; mimeType: string };
+        }>;
+      }>({
+        method: "GET",
+        path: "/poll",
+        token,
+        timeoutMs,
+      });
+      if (res.status === 204) return null;
+      if (res.status !== 200) {
+        throw new Error((res.data as { error?: string }).error ?? "Poll failed");
+      }
+      return res.data;
+    } catch (e) {
+      if (e instanceof Error && e.message === "Request timed out") return null;
+      throw e;
     }
-    return res.data;
   }
 
   async inbox(token: string): Promise<{
