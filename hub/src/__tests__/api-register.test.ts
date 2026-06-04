@@ -70,6 +70,72 @@ describe("POST /register", () => {
     expect(res.status).toBe(409);
   });
 
+  // Drive a registered user offline by opening a poll and aborting it, so the hub
+  // sees the connection drop (poll-disconnect -> setOffline), as if the prior
+  // session's process died / its MCP server reconnected.
+  async function goOffline(token: string): Promise<void> {
+    const ac = new AbortController();
+    fetch(`${ctx.baseUrl}/poll`, { headers: { Authorization: `Bearer ${token}` }, signal: ac.signal }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 150));
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  it("reclaims a STALE (offline) registration without an old token", async () => {
+    // The reconnect-deadlock fix: a fresh session can take over a name whose prior
+    // session is gone (offline = no active poll), without an operator kick.
+    const token = await registerUser(ctx, "reg-stale");
+    await goOffline(token);
+
+    const res = await fetch(`${ctx.baseUrl}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ctx.joinToken}` },
+      body: JSON.stringify({ name: "reg-stale" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string; name: string };
+    expect(body.name).toBe("reg-stale");
+    expect(body.token).not.toBe(token); // fresh token issued
+  });
+
+  it("still rejects takeover of an ONLINE registration without an old token", async () => {
+    // A genuinely-live session (active/just-registered = online) must NOT be
+    // reclaimable without proving ownership — only stale ones are.
+    await registerUser(ctx, "reg-online"); // register -> online
+    const res = await fetch(`${ctx.baseUrl}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ctx.joinToken}` },
+      body: JSON.stringify({ name: "reg-online" }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it("preserves queued messages across a stale reclaim (no loss on reconnect)", async () => {
+    // The message-loss fix: messages that arrived while the prior session was
+    // offline survive the reconnect (previously an operator kick cleared the queue).
+    const token = await registerUser(ctx, "reg-qsave");
+    await goOffline(token);
+
+    const senderToken = await registerUser(ctx, "reg-qsender");
+    await fetch(`${ctx.baseUrl}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${senderToken}` },
+      body: JSON.stringify({ to: "@reg-qsave", content: "queued-while-offline", channel: "#all" }),
+    });
+
+    const reclaim = await fetch(`${ctx.baseUrl}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ctx.joinToken}` },
+      body: JSON.stringify({ name: "reg-qsave" }),
+    });
+    const { token: newToken } = (await reclaim.json()) as { token: string };
+
+    const inbox = (await (
+      await fetch(`${ctx.baseUrl}/inbox`, { headers: { Authorization: `Bearer ${newToken}` } })
+    ).json()) as { messages: { content: string }[] };
+    expect(inbox.messages.some((m) => m.content === "queued-while-offline")).toBe(true);
+  });
+
   it("should reject missing name", async () => {
     const res = await fetch(`${ctx.baseUrl}/register`, {
       method: "POST",

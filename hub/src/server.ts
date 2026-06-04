@@ -69,14 +69,24 @@ const handleRegister: RouteHandler = async (req, res) => {
     return sendError(res, 400, "Missing or invalid 'name' field");
   }
   try {
-    // Allow reconnection only if the caller proves ownership with the old token
+    // Allow reconnection when the caller proves ownership with the old token, OR
+    // when the existing registration is STALE — offline, i.e. no active poll, so
+    // the prior session is gone. The stale case is the reconnect path: a new MCP
+    // session can't hold the old token, so without this it deadlocks on the dead
+    // registration and needs an operator kick (which then also clears the queue
+    // and loses in-flight messages). A genuinely-live (online) session is still
+    // protected from an unproven takeover.
     if (isUserRegistered(body.name)) {
       const existingToken = getUserToken(body.name);
-      if (!body.oldToken || body.oldToken !== existingToken) {
+      const ownsToken = !!body.oldToken && body.oldToken === existingToken;
+      const staleReclaim = !isOnline(body.name);
+      if (!ownsToken && !staleReclaim) {
         return sendError(res, 409, `User "${body.name}" is already registered`);
       }
       removePoll(body.name);
-      removeQueue(body.name);
+      // Deliberately NOT removeQueue: preserve queued messages across the reclaim
+      // so anything that arrived while the prior session was offline reaches the
+      // reconnecting one. ensureQueue below keeps the existing queue.
       unregisterUser(body.name);
     }
     // Cancel grace timer if reconnecting
