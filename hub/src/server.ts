@@ -39,7 +39,7 @@ import {
 } from "./db.js";
 import { addSSEClient, broadcast } from "./events.js";
 import { launchAgent } from "./launcher.js";
-import { addPoll, isOnline, onPollDisconnect, removePoll, setOffline, setOnline } from "./polling.js";
+import { addPoll, getLastSeen, isOnline, onPollDisconnect, removePoll, setOffline, setOnline } from "./polling.js";
 import { drainQueue, enqueueAndDeliver, ensureQueue, notifyBridges, removeQueue, routeMessage } from "./router.js";
 import type { RegisterRequest, RouteHandler, SendRequest } from "./types.js";
 
@@ -193,6 +193,9 @@ const handleUsers: RouteHandler = async (_req, res) => {
     name,
     online: isOnline(name),
     role: getUserRole(name) ?? "agent",
+    // Epoch ms of the user's most recent poll (null if never polled). A stale value
+    // on an online-looking user flags a silently-dead listener.
+    lastSeen: getLastSeen(name),
   }));
   sendJson(res, 200, { users });
 };

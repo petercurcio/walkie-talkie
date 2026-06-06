@@ -9,6 +9,11 @@ const pendingPolls = new Map<string, PendingPoll>();
 // Registered users NOT in this set are considered online (default = online).
 const offlineUsers = new Set<string>();
 
+// Per-subscriber last-seen: epoch ms of the user's most recent poll. Lets a
+// silently-dead subscriber (listener wedged/killed → no recent poll) be detected
+// via /users, instead of looking identical to an idle-but-healthy channel.
+const lastSeen = new Map<string, number>();
+
 let onDisconnectCallback: ((userName: string) => void) | null = null;
 
 export function onPollDisconnect(cb: (userName: string) => void): void {
@@ -27,8 +32,14 @@ export function setOffline(userName: string): void {
   offlineUsers.add(userName);
 }
 
+/** Epoch ms of the user's most recent poll, or null if they have never polled. */
+export function getLastSeen(userName: string): number | null {
+  return lastSeen.get(userName) ?? null;
+}
+
 export function addPoll(userName: string, req: IncomingMessage, res: ServerResponse): void {
   removePoll(userName);
+  lastSeen.set(userName, Date.now());
 
   console.log(`[poll-start] ${userName} waiting for messages...`);
 
