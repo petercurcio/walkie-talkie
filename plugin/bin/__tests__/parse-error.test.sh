@@ -61,5 +61,14 @@ else
   echo "FAIL: expected exit 4, got $rc"; fail=1
 fi
 
+# The marker names a raw-body dump file for diagnosis; it must exist and hold the bad body.
+dumpfile=$(printf '%s' "$out" | sed -n 's/.*Raw body saved to \(.*\)$/\1/p')
+if [ -n "$dumpfile" ] && [ -f "$dumpfile" ] && grep -q "not valid json" "$dumpfile"; then
+  echo "PASS: raw unparseable body dumped for diagnosis ($dumpfile)"
+  rm -f "$dumpfile"
+else
+  echo "FAIL: expected a raw-body dump file containing the bad body (got path: '$dumpfile')"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$fail"

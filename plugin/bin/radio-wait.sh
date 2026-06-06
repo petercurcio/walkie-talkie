@@ -108,7 +108,12 @@ for m in messages:
           # "consume-and-drop" / silent-inbox-stall the fleet hit). Instead emit a LOUD,
           # DISTINCT marker on stdout (so radio-listen surfaces it instead of silent-
           # retrying, and a raw caller sees it) and exit 4 (distinct from outage's 1).
-          echo "RADIO_PARSE_ERROR: /poll returned a 200 body that did not parse (possibly truncated) - a message was likely consumed but NOT delivered; re-check radio_check/inbox and ask the sender to re-send if something is missing"
+          # Dump the raw unparseable body for diagnosis (is it truncated vs valid-but-huge?
+          # an incomplete-JSON dump = transport truncation). Keyed by pid+epoch so concurrent
+          # / repeated failures don't collide. Best-effort; never let the dump itself fail us.
+          dump="/tmp/radio-parsefail-$$-$(date +%s).raw"
+          printf '%s' "$body" > "$dump" 2>/dev/null || dump="(dump failed)"
+          echo "RADIO_PARSE_ERROR: /poll returned a 200 body that did not parse (possibly truncated) - a message was likely consumed but NOT delivered; re-check radio_check/inbox and ask the sender to re-send if something is missing. Raw body saved to $dump"
           exit 4
           ;;
       esac
