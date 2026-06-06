@@ -29,6 +29,7 @@ tail -n +2 "$MOCK_QUEUE" > "$MOCK_QUEUE.tmp" 2>/dev/null && mv "$MOCK_QUEUE.tmp"
 case "$line" in
   ERR)   exit 1 ;;                          # connection outage: empty stdout, rc=1
   KILL)  echo "RADIO_KILLED"; exit 1 ;;     # 401 / explicit kill
+  PARSE) echo "RADIO_PARSE_ERROR: simulated parse fail"; exit 4 ;;  # 200 body didn't parse
   MSG:*) echo "${line#MSG:}"; exit 0 ;;     # delivered message
   *)     exit 1 ;;                          # queue exhausted -> behave as outage
 esac
@@ -74,6 +75,15 @@ MSG:[12:00:02] #all bob -> skills: ping"
 assert_yes "$TMP/inbox" "dora: standup" "cross-talk captured to inbox"
 assert_yes "$TMP/inbox" "skills: ping" "relevant message captured (and woke)"
 assert_no  "$TMP/inbox" "RADIO_DOWN" "cross-talk path writes no RADIO_DOWN"
+
+# --- Case 4: parse error surfaced LOUDLY, not silent-retried, not RADIO_DOWN ------
+# The silent-drop fix: a 200-body parse failure must land a visible marker and the
+# listener keeps going — NOT vanish into the connection-outage silent-retry path.
+run_case "parse-error-surfaced" "PARSE
+MSG:[12:00:03] #all alice -> skills: after-parse"
+assert_yes "$TMP/inbox" "RADIO_PARSE_ERROR" "parse error appended loudly (not silent)"
+assert_yes "$TMP/inbox" "skills: after-parse" "listener kept going after a parse error"
+assert_no  "$TMP/inbox" "RADIO_DOWN" "parse error is NOT mislabeled RADIO_DOWN"
 
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$fail"

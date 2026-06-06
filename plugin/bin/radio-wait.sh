@@ -36,7 +36,12 @@ while true; do
 
   case "$http_code" in
     200)
-      # Parse JSON and format messages using python3 (macOS built-in)
+      # Parse JSON and format messages using python3 (macOS built-in).
+      # Scope OFF errexit around the pipe: with `set -e`, a non-zero python exit aborts
+      # the script right here (errexit fires on the pipeline's exit status), so the
+      # `case "$py_exit"` below was never reached for empty/killed/parse-fail — making
+      # those branches dead code. Disabling errexit just for the pipe makes the case work.
+      set +e
       echo "$body" | python3 -c "
 import sys, json, os, base64, tempfile, datetime
 
@@ -89,11 +94,23 @@ for m in messages:
     print(f'[{time_str}] {channel} {from_user} -> {to_user}: {content}{image_info}')
 "
       py_exit=$?
+      set -e
       case "$py_exit" in
         0) exit 0 ;;       # Messages printed successfully
         2) continue ;;     # Empty messages, retry poll
         3) exit 1 ;;       # RADIO_KILLED
-        *) exit 1 ;;       # Parse error
+        *)
+          # Parse/processing failure on a 200 body (invalid or truncated JSON, bad
+          # image, etc.). The hub already drained these message(s) from the queue when
+          # it sent the 200, so they are CONSUMED but undelivered. Exiting 1 with empty
+          # stdout here is indistinguishable from a connection outage, so radio-listen
+          # would silently retry and the message would be lost without a trace (the
+          # "consume-and-drop" / silent-inbox-stall the fleet hit). Instead emit a LOUD,
+          # DISTINCT marker on stdout (so radio-listen surfaces it instead of silent-
+          # retrying, and a raw caller sees it) and exit 4 (distinct from outage's 1).
+          echo "RADIO_PARSE_ERROR: /poll returned a 200 body that did not parse (possibly truncated) - a message was likely consumed but NOT delivered; re-check radio_check/inbox and ask the sender to re-send if something is missing"
+          exit 4
+          ;;
       esac
       ;;
     204)
