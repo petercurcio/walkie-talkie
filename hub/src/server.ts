@@ -29,6 +29,7 @@ import {
   dbGetAgentConfig,
   dbGetChannel,
   dbGetChannelMessages,
+  dbGetDeliveryHighWater,
   dbGetRecentMessages,
   dbGetUnreadCounts,
   dbGetUserChannels,
@@ -45,6 +46,7 @@ import {
   hasActivePoll,
   isOnline,
   onPollDisconnect,
+  recordSeen,
   removePoll,
   setOffline,
   setOnline,
@@ -223,7 +225,31 @@ const handleInbox: RouteHandler = async (_req, res, userName) => {
 
 const handlePoll: RouteHandler = async (req, res, userName) => {
   const wasOffline = !isOnline(userName!);
-  addPoll(userName!, req, res);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const cursorParam = url.searchParams.get("cursor");
+
+  // cursor=init: establish the delivery high-water mark with no backlog. A client with no
+  // persisted cursor (first run, or its cursor file was wiped) calls this once to learn where
+  // "now" is, then long-polls with that cursor going forward. Responds immediately.
+  if (cursorParam === "init") {
+    recordSeen(userName!);
+    if (wasOffline) {
+      setOnline(userName!);
+      broadcast({ type: "status", name: userName!, online: true, timestamp: Date.now() });
+    }
+    sendJson(res, 200, { messages: [], cursor: dbGetDeliveryHighWater(userName!) });
+    return;
+  }
+
+  // A numeric cursor selects serve-by-cursor (at-least-once); a malformed value falls back
+  // to the legacy drain path (undefined), which is the safe default.
+  let cursor: number | undefined;
+  if (cursorParam !== null) {
+    const n = Number(cursorParam);
+    if (Number.isFinite(n)) cursor = n;
+  }
+
+  addPoll(userName!, req, res, cursor);
   if (wasOffline) {
     setOnline(userName!);
     broadcast({ type: "status", name: userName!, online: true, timestamp: Date.now() });

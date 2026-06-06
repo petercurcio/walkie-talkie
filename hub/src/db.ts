@@ -226,6 +226,18 @@ export function dbGetDeliveriesAfter(
   return { messages, cursor: newCursor };
 }
 
+/**
+ * The current highest delivery id for `recipient` (0 if none). The "now" mark a client with
+ * no persisted cursor (first run, or cursor file wiped) adopts via cursor=init, so it starts
+ * receiving from this point forward instead of replaying the whole delivery history.
+ */
+export function dbGetDeliveryHighWater(recipient: string): number {
+  const row = db.prepare("SELECT MAX(id) AS hw FROM deliveries WHERE recipient = ?").get(recipient) as {
+    hw: number | null;
+  };
+  return row.hw ?? 0;
+}
+
 export function dbGetChannelMessages(channel: string, limit = 50): Message[] {
   const rows = db
     .prepare(

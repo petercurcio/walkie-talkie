@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dbGetDeliveriesAfter } from "./db.js";
 import { drainQueue } from "./router.js";
 import type { PendingPoll } from "./types.js";
 
@@ -37,12 +38,28 @@ export function getLastSeen(userName: string): number | null {
   return lastSeen.get(userName) ?? null;
 }
 
+/**
+ * Stamp the user's last-seen now, for poll paths that don't go through addPoll (the
+ * cursor=init bootstrap responds immediately without registering a pending poll, but it's
+ * still a real poll that proves the listener is alive).
+ */
+export function recordSeen(userName: string): void {
+  lastSeen.set(userName, Date.now());
+}
+
 /** True if the user currently has a live long-poll connection open. */
 export function hasActivePoll(userName: string): boolean {
   return pendingPolls.has(userName);
 }
 
-export function addPoll(userName: string, req: IncomingMessage, res: ServerResponse): void {
+/**
+ * Register a long-poll for `userName`. When `cursor` is a number, the poll is resolved in
+ * serve-by-cursor (at-least-once) mode: messages are read from the persisted delivery log
+ * after that cursor and are NOT removed, so a lost/unparsed 200 recovers on the next poll
+ * with the same cursor. When `cursor` is undefined, the legacy drain path (at-most-once) is
+ * used unchanged, so any client that doesn't send a cursor keeps its prior behavior.
+ */
+export function addPoll(userName: string, req: IncomingMessage, res: ServerResponse, cursor?: number): void {
   removePoll(userName);
   lastSeen.set(userName, Date.now());
 
@@ -55,7 +72,7 @@ export function addPoll(userName: string, req: IncomingMessage, res: ServerRespo
     res.end();
   }, POLL_TIMEOUT_MS);
 
-  pendingPolls.set(userName, { userName, res, timer });
+  pendingPolls.set(userName, { userName, res, timer, cursor });
 
   // Detect unexpected connection drop (agent crash, network loss).
   // Listen on req (not res) — more reliable when no response has been written yet.
@@ -68,7 +85,21 @@ export function addPoll(userName: string, req: IncomingMessage, res: ServerRespo
     }
   });
 
-  // Check if there are already queued messages
+  // Immediate check: deliver anything already available so the client doesn't wait.
+  if (cursor !== undefined) {
+    const { messages, cursor: newCursor } = dbGetDeliveriesAfter(userName, cursor);
+    if (messages.length > 0) {
+      clearTimeout(timer);
+      pendingPolls.delete(userName);
+      drainQueue(userName); // discard the parallel in-memory queue; the log is authoritative
+      console.log(`[poll-immediate] ${userName} <- ${messages.length} message(s) (cursor ${cursor}->${newCursor})`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ messages, cursor: newCursor }));
+    }
+    return;
+  }
+
+  // Legacy at-most-once: drain the in-memory queue.
   const messages = drainQueue(userName);
   if (messages.length > 0) {
     clearTimeout(timer);
@@ -83,6 +114,22 @@ export function deliverMessage(userName: string): void {
   const poll = pendingPolls.get(userName);
   if (!poll) return;
 
+  // Serve-by-cursor wake: re-query the delivery log after the poll's cursor.
+  if (poll.cursor !== undefined) {
+    const { messages, cursor: newCursor } = dbGetDeliveriesAfter(userName, poll.cursor);
+    if (messages.length === 0) return;
+
+    clearTimeout(poll.timer);
+    pendingPolls.delete(userName);
+    drainQueue(userName); // discard the parallel in-memory queue; the log is authoritative
+    console.log(`[poll-deliver] ${userName} <- ${messages.length} message(s) (cursor ${poll.cursor}->${newCursor})`);
+
+    poll.res.writeHead(200, { "Content-Type": "application/json" });
+    poll.res.end(JSON.stringify({ messages, cursor: newCursor }));
+    return;
+  }
+
+  // Legacy at-most-once wake.
   const messages = drainQueue(userName);
   if (messages.length === 0) return;
 

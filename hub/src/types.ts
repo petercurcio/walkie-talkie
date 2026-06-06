@@ -69,6 +69,12 @@ export type PendingPoll = {
   userName: string;
   res: ServerResponse;
   timer: ReturnType<typeof setTimeout>;
+  /**
+   * Delivery cursor for serve-by-cursor (at-least-once) polls. When set, the poll is
+   * resolved from the persisted delivery log (deliveries after this id), NOT by draining
+   * the in-memory queue. Undefined = a legacy drain poll (at-most-once, backward compat).
+   */
+  cursor?: number;
 };
 
 export type RouteHandler = (req: IncomingMessage, res: ServerResponse, userName?: string) => Promise<void>;
