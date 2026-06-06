@@ -11,7 +11,7 @@ afterAll(async () => {
   await stopTestServer(ctx);
 });
 
-type UserRow = { name: string; online: boolean; role: string; lastSeen: number | null };
+type UserRow = { name: string; online: boolean; role: string; lastSeen: number | null; hasActivePoll: boolean };
 
 async function getUsers(): Promise<UserRow[]> {
   const res = await fetch(`${ctx.baseUrl}/users`);
@@ -24,6 +24,27 @@ describe("/users lastSeen (silently-dead subscriber detection)", () => {
     const u = (await getUsers()).find((x) => x.name === "ls-never");
     expect(u).toBeTruthy();
     expect(u!.lastSeen).toBeNull();
+  });
+
+  it("reports hasActivePoll true only while a poll is open (true liveness, vs stale lastSeen)", async () => {
+    const token = await registerUser(ctx, "hap-user");
+
+    // No open poll yet.
+    let u = (await getUsers()).find((x) => x.name === "hap-user");
+    expect(u?.hasActivePoll).toBe(false);
+
+    // Open a long-poll; while held, hasActivePoll is true.
+    const ac = new AbortController();
+    fetch(`${ctx.baseUrl}/poll`, { headers: { Authorization: `Bearer ${token}` }, signal: ac.signal }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 150));
+    u = (await getUsers()).find((x) => x.name === "hap-user");
+    expect(u?.hasActivePoll).toBe(true);
+
+    // Once the poll closes, it drops back to false.
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 150));
+    u = (await getUsers()).find((x) => x.name === "hap-user");
+    expect(u?.hasActivePoll).toBe(false);
   });
 
   it("is a recent timestamp after the user polls", async () => {

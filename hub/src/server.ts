@@ -261,9 +261,13 @@ const handleUsers: RouteHandler = async (_req, res) => {
     name,
     online: isOnline(name),
     role: getUserRole(name) ?? "agent",
-    // Epoch ms of the user's most recent poll (null if never polled). A stale value
-    // on an online-looking user flags a silently-dead listener.
+    // Epoch ms of the user's most recent poll (null if never polled). NOTE: stamped at poll
+    // START, and a healthy long-poll holds open up to an hour, so a stale lastSeen does NOT
+    // by itself mean a dead listener — use hasActivePoll for that.
     lastSeen: getLastSeen(name),
+    // True liveness: the user has an open long-poll right now. The reliable "is this
+    // subscriber actually listening" signal (lastSeen ages during a quiet healthy poll).
+    hasActivePoll: hasActivePoll(name),
   }));
   sendJson(res, 200, { users });
 };
