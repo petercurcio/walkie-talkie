@@ -10,11 +10,13 @@ import {
   dbGetAgentConfig,
   dbGetChannel,
   dbGetChannelMessages,
+  dbGetDeliveriesAfter,
   dbGetRecentMessages,
   dbGetUnreadCounts,
   dbGetUserChannels,
   dbListAgentConfigs,
   dbListChannels,
+  dbRecordDelivery,
   dbRemoveAllMembersOfChannel,
   dbRemoveChannelMember,
   dbSaveMessage,
@@ -254,5 +256,54 @@ describe("agent configs", () => {
   it("should enforce unique name constraint", () => {
     dbCreateAgentConfig("n1", "unique-name", "/tmp", "echo 1", false);
     expect(() => dbCreateAgentConfig("n2", "unique-name", "/tmp", "echo 2", false)).toThrow();
+  });
+});
+
+describe("deliveries (at-least-once delivery log)", () => {
+  function deliver(recipient: string, id: string, content: string): void {
+    const msg: Message = { id, from: "alice", to: `@${recipient}`, content, channel: "#all", timestamp: Date.now() };
+    dbSaveMessage(msg);
+    dbRecordDelivery(recipient, id);
+  }
+
+  it("returns recorded deliveries in order with an advancing cursor", () => {
+    deliver("bob", "m1", "one");
+    deliver("bob", "m2", "two");
+    const r = dbGetDeliveriesAfter("bob", 0);
+    expect(r.messages.map((m) => m.content)).toEqual(["one", "two"]);
+    expect(r.cursor).toBeGreaterThan(0);
+  });
+
+  it("returns only deliveries after the given cursor", () => {
+    deliver("bob", "m1", "one");
+    const first = dbGetDeliveriesAfter("bob", 0);
+    deliver("bob", "m2", "two");
+    const second = dbGetDeliveriesAfter("bob", first.cursor);
+    expect(second.messages.map((m) => m.content)).toEqual(["two"]);
+    expect(second.cursor).toBeGreaterThan(first.cursor);
+  });
+
+  it("isolates deliveries per recipient", () => {
+    deliver("bob", "m1", "for-bob");
+    deliver("carol", "m2", "for-carol");
+    expect(dbGetDeliveriesAfter("bob", 0).messages.map((m) => m.content)).toEqual(["for-bob"]);
+    expect(dbGetDeliveriesAfter("carol", 0).messages.map((m) => m.content)).toEqual(["for-carol"]);
+  });
+
+  it("returns empty + unchanged cursor when nothing is new (idempotent re-ack)", () => {
+    deliver("bob", "m1", "one");
+    const r = dbGetDeliveriesAfter("bob", 0);
+    const again = dbGetDeliveriesAfter("bob", r.cursor);
+    expect(again.messages).toEqual([]);
+    expect(again.cursor).toBe(r.cursor);
+  });
+
+  it("preserves message fields through the join", () => {
+    deliver("bob", "m1", "hello");
+    const m = dbGetDeliveriesAfter("bob", 0).messages[0];
+    expect(m.id).toBe("m1");
+    expect(m.from).toBe("alice");
+    expect(m.content).toBe("hello");
+    expect(m.channel).toBe("#all");
   });
 });

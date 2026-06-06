@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getUserRole, getUsersByRole, isUserRegistered } from "./auth.js";
 import { getChannelMembers, isChannelMember } from "./channels.js";
-import { dbSaveMessage } from "./db.js";
+import { dbRecordDelivery, dbSaveMessage } from "./db.js";
 import { deliverMessage } from "./polling.js";
 import type { Message, MessageImage } from "./types.js";
 
@@ -91,6 +91,10 @@ export function routeMessage(
 }
 
 export function enqueueAndDeliver(targetName: string, message: Message): void {
+  // Record the delivery (at-least-once log) at the single routing chokepoint, so the log is
+  // exactly the routing output. Phase 1: log only — the in-memory queue below still drives
+  // /poll, so behavior is unchanged until the serve-by-cursor path lands.
+  dbRecordDelivery(targetName, message.id);
   ensureQueue(targetName);
   const queue = messageQueues.get(targetName)!;
   queue.push(message);
