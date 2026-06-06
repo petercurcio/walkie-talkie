@@ -25,6 +25,20 @@ export function resolveWaitScript(thisDir: string, exists: (p: string) => boolea
 }
 
 /**
+ * Resolve the on-disk path to `radio-listen.sh` — the relevance-filtered background
+ * listener agents actually drive (radio-wait.sh is the lower-level one-shot poll it wraps).
+ * Same dual-candidate probing as resolveWaitScript. Surfaced by radio_token so agents
+ * don't have to guess/`find` the listener path from the returned wait-script path.
+ */
+export function resolveListenScript(thisDir: string, exists: (p: string) => boolean = fs.existsSync): string {
+  const candidates = [
+    path.resolve(thisDir, "..", "bin", "radio-listen.sh"),
+    path.resolve(thisDir, "..", "..", "plugin", "bin", "radio-listen.sh"),
+  ];
+  return candidates.find(exists) ?? candidates[0];
+}
+
+/**
  * Render the hub's connected-user list for `radio_channels`.
  *
  * The hub returns user OBJECTS (`{ name, online, role }`), so rendering must

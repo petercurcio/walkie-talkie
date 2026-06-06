@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { HubClient } from "./client.js";
-import { formatConnectedUsers, resolveWaitScript } from "./helpers.js";
+import { formatConnectedUsers, resolveListenScript, resolveWaitScript } from "./helpers.js";
 
 const MIME_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -485,7 +485,10 @@ export function createMcpServer(hubUrl: string, joinTok: string): McpServer {
 
   server.tool(
     "radio_token",
-    "Get the current session token, hub URL, and path to radio-wait.sh script. Use this to run the wait script in a terminal for real-time polling.",
+    "Get the current session token, hub URL, and the script paths for real-time polling. " +
+      "listenScript (radio-listen.sh) is the relevance-filtered background listener to run " +
+      "(launch it as a tracked background task); waitScript (radio-wait.sh) is the lower-level " +
+      "one-shot poll it wraps.",
     {},
     async () => {
       if (!currentToken) {
@@ -494,7 +497,7 @@ export function createMcpServer(hubUrl: string, joinTok: string): McpServer {
           isError: true,
         };
       }
-      const waitScript = resolveWaitScript(path.dirname(fileURLToPath(import.meta.url)));
+      const thisDir = path.dirname(fileURLToPath(import.meta.url));
       return {
         content: [
           {
@@ -502,7 +505,8 @@ export function createMcpServer(hubUrl: string, joinTok: string): McpServer {
             text: JSON.stringify({
               hubUrl: client.getBaseUrl(),
               token: currentToken,
-              waitScript,
+              listenScript: resolveListenScript(thisDir),
+              waitScript: resolveWaitScript(thisDir),
             }),
           },
         ],

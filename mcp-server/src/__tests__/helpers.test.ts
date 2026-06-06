@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatConnectedUsers, resolveWaitScript } from "../helpers.js";
+import { formatConnectedUsers, resolveListenScript, resolveWaitScript } from "../helpers.js";
 
 describe("resolveWaitScript", () => {
   // radio-wait.sh physically lives only at <repo>/plugin/bin/radio-wait.sh.
@@ -27,6 +27,26 @@ describe("resolveWaitScript", () => {
   it("falls back to the first candidate when no candidate exists on disk", () => {
     const result = resolveWaitScript("/repo/mcp-server/dist", () => false);
     expect(result).toBe("/repo/mcp-server/bin/radio-wait.sh");
+  });
+});
+
+describe("resolveListenScript", () => {
+  // radio-listen.sh lives alongside radio-wait.sh at <repo>/plugin/bin/.
+  const REAL = "/repo/plugin/bin/radio-listen.sh";
+  const existsOnlyPluginBin = (p: string) => p === REAL;
+
+  it("resolves the real plugin/bin path from the mcp-server/dist build", () => {
+    const result = resolveListenScript("/repo/mcp-server/dist", existsOnlyPluginBin);
+    expect(result).toBe(REAL);
+    expect(result).not.toBe("/repo/mcp-server/bin/radio-listen.sh");
+  });
+
+  it("resolves the real plugin/bin path from the bundled plugin/dist entry", () => {
+    expect(resolveListenScript("/repo/plugin/dist", existsOnlyPluginBin)).toBe(REAL);
+  });
+
+  it("falls back to the first candidate when none exist on disk", () => {
+    expect(resolveListenScript("/repo/mcp-server/dist", () => false)).toBe("/repo/mcp-server/bin/radio-listen.sh");
   });
 });
 
