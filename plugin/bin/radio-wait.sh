@@ -17,10 +17,24 @@ fi
 MAX_RETRIES=3
 retry_count=0
 
+# At-least-once delivery (opt-in via RADIO_CURSOR_FILE; unset = legacy at-most-once, byte-for-
+# byte unchanged). When set, each poll sends the persisted cursor (?cursor=N), bootstrapping
+# with cursor=init when none exists; the python below dedups by id and advances the cursor
+# file from the server's returned cursor. State files are read/written fresh each loop, so the
+# cursor survives across the radio-listen re-invocations that drive this script.
+CURSOR_FILE="${RADIO_CURSOR_FILE:-}"
+
 while true; do
+  poll_path="/poll"
+  if [ -n "$CURSOR_FILE" ]; then
+    cursor=$(cat "$CURSOR_FILE" 2>/dev/null || true)
+    [ -z "$cursor" ] && cursor="init"
+    poll_path="/poll?cursor=$cursor"
+  fi
+
   # Long-poll with 1 hour timeout (3660s)
   response=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
-    --max-time 3660 "$HUB_URL/poll" 2>/dev/null) || {
+    --max-time 3660 "$HUB_URL$poll_path" 2>/dev/null) || {
     retry_count=$((retry_count + 1))
     if [ "$retry_count" -ge "$MAX_RETRIES" ]; then
       echo "CONNECTION_ERROR: Failed to connect after $MAX_RETRIES retries" >&2
@@ -52,6 +66,11 @@ MIME_EXT = {
     'image/webp': '.webp',
 }
 
+# At-least-once client state (only when RADIO_CURSOR_FILE is set; see radio-wait.sh header).
+CURSOR_FILE = os.environ.get('RADIO_CURSOR_FILE') or ''
+SEEN_FILE = os.environ.get('RADIO_SEEN_FILE') or ''
+SEEN_CAP = 500  # bound the dedup memory; older ids age out (the cursor prevents their re-fetch)
+
 try:
     data = json.load(sys.stdin)
 except (json.JSONDecodeError, ValueError):
@@ -59,15 +78,47 @@ except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 
 messages = data.get('messages', [])
-if not messages:
-    sys.exit(2)
+resp_cursor = data.get('cursor')
 
+def advance_cursor():
+    # Persist the server's returned cursor (the ack: next poll asks for messages after it).
+    # Best-effort; a failed write just means the same window is re-fetched and deduped.
+    if CURSOR_FILE and resp_cursor is not None:
+        try:
+            with open(CURSOR_FILE, 'w') as f:
+                f.write(str(resp_cursor))
+        except OSError:
+            pass
+
+# A kill is a control signal, not deduped content: honor it whenever it appears.
 for m in messages:
     if m.get('content', '').startswith('RADIO_KILLED:'):
         print('RADIO_KILLED')
         sys.exit(3)
 
-for m in messages:
+# Dedup by id in cursor mode: at-least-once means a redelivered (already-appended) message
+# can arrive again; surface only ids we haven't seen. Legacy mode surfaces everything.
+if CURSOR_FILE:
+    seen = []
+    if SEEN_FILE and os.path.exists(SEEN_FILE):
+        try:
+            with open(SEEN_FILE) as f:
+                seen = [line.strip() for line in f if line.strip()]
+        except OSError:
+            seen = []
+    seen_set = set(seen)
+    fresh = [m for m in messages if m.get('id') not in seen_set]
+else:
+    seen = []
+    fresh = messages
+
+if not fresh:
+    # Empty poll, or every message was a dupe: nothing to surface. Advance past this window
+    # (we have it) and let the caller re-poll. Exit 2 == 'continue' in the shell case.
+    advance_cursor()
+    sys.exit(2)
+
+for m in fresh:
     from_user = m.get('from', '?')
     to_user = m.get('to', '?')
     content = m.get('content', '')
@@ -92,6 +143,19 @@ for m in messages:
         image_info = f' [image: {path}]'
 
     print(f'[{time_str}] {channel} {from_user} -> {to_user}: {content}{image_info}')
+
+# Cursor mode: record the surfaced ids (bounded) and advance the cursor AFTER printing, so
+# the ack only moves once these messages have actually been emitted to the caller.
+if CURSOR_FILE:
+    if SEEN_FILE:
+        new_seen = seen + [m.get('id') for m in fresh if m.get('id')]
+        new_seen = new_seen[-SEEN_CAP:]
+        try:
+            with open(SEEN_FILE, 'w') as f:
+                f.write('\n'.join(new_seen) + '\n')
+        except OSError:
+            pass
+    advance_cursor()
 "
       py_exit=$?
       set -e

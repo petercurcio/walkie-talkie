@@ -58,6 +58,15 @@ if [ ! -x "$WAIT" ]; then
   exit 1
 fi
 
+# At-least-once delivery state, co-located with the inbox (same durability). radio-wait reads
+# these to send its cursor on each poll and dedup redelivered ids; it advances the cursor only
+# after surfacing a message, so anything unconfirmed re-delivers. An env override wins (test
+# seam / operator who wants a durable-dir cursor that survives a /tmp wipe). Exported so the
+# radio-wait child inherits them.
+: "${RADIO_CURSOR_FILE:=${INBOX}.cursor}"
+: "${RADIO_SEEN_FILE:=${INBOX}.seen}"
+export RADIO_CURSOR_FILE RADIO_SEEN_FILE
+
 # Reconnect backoff after a connection outage (env-tunable; resets on a healthy poll).
 BACKOFF_MIN="${RADIO_BACKOFF_MIN:-5}"
 BACKOFF_MAX="${RADIO_BACKOFF_MAX:-120}"
