@@ -39,7 +39,16 @@ import {
 } from "./db.js";
 import { addSSEClient, broadcast } from "./events.js";
 import { launchAgent } from "./launcher.js";
-import { addPoll, getLastSeen, isOnline, onPollDisconnect, removePoll, setOffline, setOnline } from "./polling.js";
+import {
+  addPoll,
+  getLastSeen,
+  hasActivePoll,
+  isOnline,
+  onPollDisconnect,
+  removePoll,
+  setOffline,
+  setOnline,
+} from "./polling.js";
 import { drainQueue, enqueueAndDeliver, ensureQueue, notifyBridges, removeQueue, routeMessage } from "./router.js";
 import type { RegisterRequest, RouteHandler, SendRequest } from "./types.js";
 
@@ -63,30 +72,63 @@ function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { error: message });
 }
 
+// How long a registration can be online-but-not-polling before a reconnecting session may
+// reclaim it. Longer than any normal wake→re-arm gap (seconds), so a live re-arming agent is
+// never reclaimed; short enough to unblock a reconnect against a stuck/abandoned listener.
+const DEFAULT_RECLAIM_STALE_MS = 60_000;
+
+/**
+ * Whether a new /register call may take over an existing registration of the same name.
+ * Pure (no I/O) so every state is unit-testable. Reclaim when:
+ *   - the caller proves ownership with the matching old token, OR
+ *   - the prior session is gone: offline (poll dropped → detected), OR online-but-not-
+ *     actively-polling with a stale last-seen (a 204'd / abandoned zombie poll, e.g. a
+ *     lingering old MCP server that reconnected).
+ * A genuinely-live listener (has an active poll, or polled within the stale window, or a
+ * fresh just-registered session with no lastSeen yet) is NEVER reclaimed without the token.
+ */
+export function canReclaimRegistration(opts: {
+  ownsToken: boolean;
+  online: boolean;
+  hasActivePoll: boolean;
+  lastSeen: number | null;
+  now: number;
+  staleMs: number;
+}): boolean {
+  if (opts.ownsToken) return true;
+  if (!opts.online) return true;
+  return !opts.hasActivePoll && opts.lastSeen !== null && opts.now - opts.lastSeen > opts.staleMs;
+}
+
 const handleRegister: RouteHandler = async (req, res) => {
   const body = JSON.parse(await readBody(req)) as RegisterRequest;
   if (!body.name || typeof body.name !== "string") {
     return sendError(res, 400, "Missing or invalid 'name' field");
   }
   try {
-    // Allow reconnection when the caller proves ownership with the old token, OR
-    // when the existing registration is STALE — offline, i.e. no active poll, so
-    // the prior session is gone. The stale case is the reconnect path: a new MCP
-    // session can't hold the old token, so without this it deadlocks on the dead
-    // registration and needs an operator kick (which then also clears the queue
-    // and loses in-flight messages). A genuinely-live (online) session is still
-    // protected from an unproven takeover.
+    // Reconnect reclaim (see canReclaimRegistration): take over an existing registration
+    // when the caller proves ownership, or the prior session is gone (offline, or an
+    // online-but-abandoned zombie poll). Without this a reconnecting session — which can't
+    // hold the old token — deadlocks on its own stale name and needs an operator kick
+    // (which also clears the queue and loses in-flight messages). A genuinely-live listener
+    // is still protected from an unproven takeover.
     if (isUserRegistered(body.name)) {
       const existingToken = getUserToken(body.name);
-      const ownsToken = !!body.oldToken && body.oldToken === existingToken;
-      const staleReclaim = !isOnline(body.name);
-      if (!ownsToken && !staleReclaim) {
+      const reclaim = canReclaimRegistration({
+        ownsToken: !!body.oldToken && body.oldToken === existingToken,
+        online: isOnline(body.name),
+        hasActivePoll: hasActivePoll(body.name),
+        lastSeen: getLastSeen(body.name),
+        now: Date.now(),
+        staleMs: DEFAULT_RECLAIM_STALE_MS,
+      });
+      if (!reclaim) {
         return sendError(res, 409, `User "${body.name}" is already registered`);
       }
       removePoll(body.name);
-      // Deliberately NOT removeQueue: preserve queued messages across the reclaim
-      // so anything that arrived while the prior session was offline reaches the
-      // reconnecting one. ensureQueue below keeps the existing queue.
+      // Deliberately NOT removeQueue: preserve queued messages across the reclaim so
+      // anything that arrived while the prior session was gone reaches the reconnecting one.
+      // ensureQueue below keeps the existing queue.
       unregisterUser(body.name);
     }
     // Cancel grace timer if reconnecting

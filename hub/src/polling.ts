@@ -37,6 +37,11 @@ export function getLastSeen(userName: string): number | null {
   return lastSeen.get(userName) ?? null;
 }
 
+/** True if the user currently has a live long-poll connection open. */
+export function hasActivePoll(userName: string): boolean {
+  return pendingPolls.has(userName);
+}
+
 export function addPoll(userName: string, req: IncomingMessage, res: ServerResponse): void {
   removePoll(userName);
   lastSeen.set(userName, Date.now());
