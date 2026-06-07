@@ -95,14 +95,27 @@ export function initDB(): void {
   // recorded at route time — the exact routing output, so serving doesn't re-derive routing.
   // `id` (autoincrement) is the strictly-monotonic per-recipient cursor a client acks against.
   // Phase 1 only writes + reads this; /poll still uses the in-memory queue (no behavior change).
+  // message_json is a SELF-CONTAINED snapshot of the delivered message. Earlier the row only
+  // referenced messages.id and dbGetDeliveriesAfter JOINed to it — but the messages table
+  // prunes #all (a chat-history cap), so a pruned message orphaned its delivery and a cursor
+  // client silently skipped it (at-least-once broke). Snapshotting the content here decouples
+  // delivery durability from the messages table's lifecycle entirely.
   db.exec(`
     CREATE TABLE IF NOT EXISTS deliveries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       recipient TEXT NOT NULL,
       message_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      message_json TEXT
     )
   `);
+  // Migration: add message_json to a pre-existing deliveries table. ALTER throws if the column
+  // already exists; swallow that so init stays idempotent.
+  try {
+    db.exec(`ALTER TABLE deliveries ADD COLUMN message_json TEXT`);
+  } catch {
+    /* column already present */
+  }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_deliveries_recipient_id
     ON deliveries (recipient, id)
@@ -159,7 +172,18 @@ export function dbGetUserChannels(userName: string): string[] {
   return rows.map((r) => r.channel);
 }
 
-const ALL_CHANNEL_MAX = 200;
+// #all chat-history retention cap. This ONLY bounds the dashboard's channel-history view now
+// — delivery durability no longer depends on it (deliveries snapshot their own content). The
+// upstream default was 200; raised to 5000 (trivial on disk, ~weeks of fleet history) so
+// scroll-back is generous. Read queries are independently LIMIT-bounded, so this isn't a
+// performance knob. Configurable via WALKIE_TALKIE_ALL_CHANNEL_MAX (read at call time so tests
+// and operators can override). Invalid/absent → default.
+const DEFAULT_ALL_CHANNEL_MAX = 5000;
+function allChannelMax(): number {
+  const raw = process.env.WALKIE_TALKIE_ALL_CHANNEL_MAX;
+  const n = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_ALL_CHANNEL_MAX;
+}
 
 export function dbSaveMessage(msg: Message): void {
   db.prepare(
@@ -192,20 +216,30 @@ function parseMessageRow(row: Record<string, unknown>): Message {
   };
 }
 
-/** Record that `message` was routed to `recipient` (the delivery-ack log). */
-export function dbRecordDelivery(recipient: string, messageId: string): void {
-  db.prepare("INSERT INTO deliveries (recipient, message_id, created_at) VALUES (?, ?, ?)").run(
+/**
+ * Record that `message` was routed to `recipient` (the delivery-ack log), snapshotting the
+ * full message into the row so the delivery is self-contained — it survives the messages
+ * table being pruned out from under it.
+ */
+export function dbRecordDelivery(recipient: string, message: Message): void {
+  db.prepare("INSERT INTO deliveries (recipient, message_id, created_at, message_json) VALUES (?, ?, ?, ?)").run(
     recipient,
-    messageId,
+    message.id,
     Date.now(),
+    JSON.stringify(message),
   );
 }
 
 /**
- * Messages routed to `recipient` with a delivery id greater than `cursor`, in delivery order,
- * joined to the message content. Returns the new cursor (the highest delivery id served, or
- * the input cursor if none) for the client to ack against. The basis of at-least-once: a
- * client re-asks with its last cursor and gets anything it hasn't confirmed.
+ * Messages routed to `recipient` with a delivery id greater than `cursor`, in delivery order.
+ * Returns the new cursor (the highest delivery id served, or the input cursor if none) for the
+ * client to ack against. The basis of at-least-once: a client re-asks with its last cursor and
+ * gets anything it hasn't confirmed.
+ *
+ * Content comes from the self-contained message_json snapshot. Legacy rows (recorded before
+ * the snapshot column) have NULL message_json — for those we LEFT JOIN the messages table as a
+ * best-effort fallback, and skip the row only if the message was already pruned (an
+ * unrecoverable pre-fix orphan). New rows are never orphaned.
  */
 export function dbGetDeliveriesAfter(
   recipient: string,
@@ -214,14 +248,27 @@ export function dbGetDeliveriesAfter(
 ): { messages: Message[]; cursor: number } {
   const rows = db
     .prepare(
-      `SELECT d.id AS delivery_id, m.id AS id, m."from" AS "from", m."to" AS "to",
+      `SELECT d.id AS delivery_id, d.message_json AS message_json,
+              m.id AS id, m."from" AS "from", m."to" AS "to",
               m.content AS content, m.channel AS channel, m.timestamp AS timestamp, m.image AS image
-       FROM deliveries d JOIN messages m ON m.id = d.message_id
+       FROM deliveries d LEFT JOIN messages m ON m.id = d.message_id
        WHERE d.recipient = ? AND d.id > ?
        ORDER BY d.id ASC LIMIT ?`,
     )
     .all(recipient, cursor, limit) as Record<string, unknown>[];
-  const messages = rows.map(parseMessageRow);
+
+  const messages: Message[] = [];
+  for (const row of rows) {
+    const snapshot = row.message_json as string | null;
+    if (snapshot) {
+      messages.push(JSON.parse(snapshot) as Message);
+    } else if (row.id != null) {
+      messages.push(parseMessageRow(row)); // legacy row, message still present
+    }
+    // else: legacy row whose message was pruned — unrecoverable orphan, skip.
+  }
+  // Cursor always advances to the last delivery id seen (even past a skipped orphan), so a
+  // dead pre-fix orphan can never re-wedge the stream the way a parse failure once did.
   const newCursor = rows.length > 0 ? (rows[rows.length - 1].delivery_id as number) : cursor;
   return { messages, cursor: newCursor };
 }
@@ -356,13 +403,14 @@ export function dbDeleteAgentConfig(id: string): boolean {
 }
 
 function dbPruneAllChannel(): void {
+  const max = allChannelMax();
   const count = (db.prepare("SELECT COUNT(*) as cnt FROM messages WHERE channel = '#all'").get() as { cnt: number })
     .cnt;
-  if (count > ALL_CHANNEL_MAX) {
+  if (count > max) {
     db.prepare(
       `DELETE FROM messages WHERE channel = '#all' AND id NOT IN (
         SELECT id FROM messages WHERE channel = '#all' ORDER BY timestamp DESC LIMIT ?
       )`,
-    ).run(ALL_CHANNEL_MAX);
+    ).run(max);
   }
 }

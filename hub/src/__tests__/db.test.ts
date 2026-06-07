@@ -143,18 +143,21 @@ describe("messages", () => {
     expect(dbGetChannelMessages("#all", 3)).toHaveLength(3);
   });
 
-  it("should prune #all channel beyond 200 messages", () => {
-    for (let i = 0; i < 210; i++) {
-      dbSaveMessage(
-        makeMsg({
-          id: `prune-${i}`,
-          timestamp: i,
-        }),
-      );
+  it("should prune #all channel beyond the configured cap (newest kept)", () => {
+    process.env.WALKIE_TALKIE_ALL_CHANNEL_MAX = "5"; // override the 5000 default for a fast test
+    try {
+      for (let i = 0; i < 12; i++) {
+        dbSaveMessage(makeMsg({ id: `prune-${i}`, timestamp: i }));
+      }
+      const messages = dbGetChannelMessages("#all", 500);
+      expect(messages.length).toBeLessThanOrEqual(5);
+      // Pruning keeps the NEWEST: prune-11 survives, prune-0 is gone.
+      const ids = messages.map((m) => m.id);
+      expect(ids).toContain("prune-11");
+      expect(ids).not.toContain("prune-0");
+    } finally {
+      delete process.env.WALKIE_TALKIE_ALL_CHANNEL_MAX;
     }
-    // After pruning, should have at most 200
-    const messages = dbGetChannelMessages("#all", 500);
-    expect(messages.length).toBeLessThanOrEqual(200);
   });
 });
 
@@ -263,7 +266,7 @@ describe("deliveries (at-least-once delivery log)", () => {
   function deliver(recipient: string, id: string, content: string): void {
     const msg: Message = { id, from: "alice", to: `@${recipient}`, content, channel: "#all", timestamp: Date.now() };
     dbSaveMessage(msg);
-    dbRecordDelivery(recipient, id);
+    dbRecordDelivery(recipient, msg);
   }
 
   it("returns recorded deliveries in order with an advancing cursor", () => {
@@ -298,12 +301,22 @@ describe("deliveries (at-least-once delivery log)", () => {
     expect(again.cursor).toBe(r.cursor);
   });
 
-  it("preserves message fields through the join", () => {
+  it("preserves message fields through the snapshot", () => {
     deliver("bob", "m1", "hello");
     const m = dbGetDeliveriesAfter("bob", 0).messages[0];
     expect(m.id).toBe("m1");
     expect(m.from).toBe("alice");
     expect(m.content).toBe("hello");
     expect(m.channel).toBe("#all");
+  });
+
+  it("still serves a delivery after its message is pruned/deleted (self-contained snapshot)", () => {
+    // Regression for the orphan bug: the messages table prunes #all, which used to orphan the
+    // delivery (JOIN dropped it → silently skipped). The snapshot must survive the deletion.
+    deliver("bob", "m1", "durable");
+    dbDeleteChannelMessages("#all"); // simulate the prune wiping the source message
+    const r = dbGetDeliveriesAfter("bob", 0);
+    expect(r.messages.map((m) => m.content)).toEqual(["durable"]);
+    expect(r.cursor).toBeGreaterThan(0);
   });
 });
