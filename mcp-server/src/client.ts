@@ -16,9 +16,14 @@ interface HubResponse<T = unknown> {
 
 export class HubClient {
   private baseUrl: URL;
+  private retryBackoffsMs: number[];
 
-  constructor(hubUrl: string) {
+  constructor(hubUrl: string, opts?: { retryBackoffsMs?: number[] }) {
     this.baseUrl = new URL(hubUrl);
+    // Backoff schedule for send retries on hub-unreachable. ~15s total across 4 retries —
+    // long enough to ride out a brief hub restart, short enough to stay well under the MCP
+    // tool-call timeout (a too-long block drops the whole MCP server, cf. radio_standby).
+    this.retryBackoffsMs = opts?.retryBackoffsMs ?? [1000, 2000, 4000, 8000];
   }
 
   getBaseUrl(): string {
@@ -81,6 +86,32 @@ export class HubClient {
     });
   }
 
+  /**
+   * Like request(), but retries connection-class failures (refused / reset / timeout) on a
+   * bounded backoff. Closes the "a send during a hub restart silently vanishes" gap: a brief
+   * hub-down window is ridden out instead of failing instantly. Crucially, it does NOT retry
+   * a response the hub actually returned — a resolved non-2xx (e.g. 404 user-not-connected)
+   * comes back so the caller can throw it terminally, and an "Invalid JSON" (hub responded,
+   * send likely processed) is re-thrown without retry, so we never duplicate a send the hub
+   * already accepted.
+   */
+  private async requestWithRetry<T>(options: RequestOptions): Promise<HubResponse<T>> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= this.retryBackoffsMs.length; attempt++) {
+      try {
+        return await this.request<T>(options);
+      } catch (e) {
+        lastErr = e;
+        if ((e as Error).message?.startsWith("Invalid JSON response")) throw e;
+        if (attempt < this.retryBackoffsMs.length) {
+          await new Promise((r) => setTimeout(r, this.retryBackoffsMs[attempt]));
+          continue;
+        }
+      }
+    }
+    throw new Error(`hub unreachable, send not delivered (after ${this.retryBackoffsMs.length} retries): ${(lastErr as Error).message}`);
+  }
+
   async register(name: string, joinToken: string, oldToken?: string): Promise<{ token: string; name: string }> {
     const body: { name: string; oldToken?: string } = { name };
     if (oldToken) body.oldToken = oldToken;
@@ -117,7 +148,7 @@ export class HubClient {
     };
     if (channel) body.channel = channel;
     if (image) body.image = image;
-    const res = await this.request<{ id: string; to: string }>({
+    const res = await this.requestWithRetry<{ id: string; to: string }>({
       method: "POST",
       path: "/send",
       token,
