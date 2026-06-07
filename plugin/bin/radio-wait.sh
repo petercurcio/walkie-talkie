@@ -44,9 +44,14 @@ while true; do
     continue
   }
 
-  # Extract HTTP status code (last line) and body (everything else)
-  http_code=$(echo "$response" | tail -n1)
-  body=$(echo "$response" | sed '$d')
+  # Extract HTTP status code (last line) and body (everything else).
+  # Use printf '%s\n', NOT echo: /bin/sh's echo interprets backslash escapes, so a body
+  # containing valid JSON with escaped \n (any multi-line message content) gets its \n turned
+  # into real newlines here, corrupting the JSON before it's parsed. That mangling caused a
+  # fleet-wide RADIO_PARSE_ERROR storm (2026-06-07): the bad parse never advanced the cursor,
+  # so the multi-line message redelivered forever and tight-looped every listener.
+  http_code=$(printf '%s\n' "$response" | tail -n1)
+  body=$(printf '%s\n' "$response" | sed '$d')
 
   case "$http_code" in
     200)
@@ -56,7 +61,7 @@ while true; do
       # `case "$py_exit"` below was never reached for empty/killed/parse-fail — making
       # those branches dead code. Disabling errexit just for the pipe makes the case work.
       set +e
-      echo "$body" | python3 -c "
+      printf '%s\n' "$body" | python3 -c "
 import sys, json, os, base64, tempfile, datetime
 
 MIME_EXT = {
