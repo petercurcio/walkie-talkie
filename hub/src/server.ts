@@ -116,8 +116,27 @@ const handleRegister: RouteHandler = async (req, res) => {
     // is still protected from an unproven takeover.
     if (isUserRegistered(body.name)) {
       const existingToken = getUserToken(body.name);
+      const ownsToken = !!body.oldToken && body.oldToken === existingToken;
+
+      // Idempotent re-join by the proven owner: keep the SAME token and do NOT disrupt the
+      // live poll. Rotating the token on every re-join orphaned the still-running listener
+      // (its old token then 401'd) and drove the re-arm churn — each radio_join killed the
+      // listener it was meant to refresh. Just clear any grace timer, refresh liveness, and
+      // return the existing token. (Memberships/queue/deliveries are untouched and intact.)
+      if (ownsToken) {
+        const grace = staleTimers.get(body.name);
+        if (grace) {
+          clearTimeout(grace);
+          staleTimers.delete(body.name);
+        }
+        setOnline(body.name);
+        broadcast({ type: "status", name: body.name, online: true, timestamp: Date.now() });
+        console.log(`[register] ${body.name} (idempotent re-join, token kept)`);
+        return sendJson(res, 200, { token: existingToken, name: body.name });
+      }
+
       const reclaim = canReclaimRegistration({
-        ownsToken: !!body.oldToken && body.oldToken === existingToken,
+        ownsToken: false,
         online: isOnline(body.name),
         hasActivePoll: hasActivePoll(body.name),
         lastSeen: getLastSeen(body.name),
