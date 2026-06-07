@@ -107,10 +107,19 @@ while true; do
   if [ -n "$out" ]; then
     printf '%s\n' "$out" >> "$INBOX"
     backoff="$BACKOFF_MIN"   # healthy poll - reset the outage backoff
-    # Immediate wake when a captured line is addressed to this agent (or @all).
-    # Exiting 0 completes the background task, which wakes the agent right away -
-    # even from full idle. Fleet cross-talk falls through and keeps polling.
-    if [ -n "$HANDLE" ] && printf '%s\n' "$out" | grep -qE -- "-> (${HANDLE}|@all):"; then
+    # HYBRID wake policy (rate-limit mitigation): each wake = one LLM turn, and a plain @all
+    # used to wake EVERY agent (N turns per broadcast) — the dominant Anthropic API load. Now
+    # wake only on something that actually needs THIS agent now:
+    #   - a direct message to this handle ("-> <handle>:"), OR
+    #   - an @all that explicitly @-mentions this handle ("-> @all: ... @<handle>").
+    # A plain @all (no mention) and @all-to-someone-else are captured to the inbox but do NOT
+    # wake — they surface at the next turn-end via the Stop-drain hook. Nothing is lost; the
+    # broadcast just stops yanking the whole fleet into a turn. Exiting 0 completes the
+    # background task, which wakes the agent immediately, even from full idle.
+    if [ -n "$HANDLE" ] && {
+      printf '%s\n' "$out" | grep -qE -- "-> ${HANDLE}:" ||
+        printf '%s\n' "$out" | grep -qE -- "-> @all:.*@${HANDLE}([^[:alnum:]_-]|$)"
+    }; then
       exit 0
     fi
     continue
