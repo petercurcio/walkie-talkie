@@ -93,6 +93,18 @@ if [ -n "$PIDFILE" ]; then
   trap 'rm -f "$PIDFILE"; exit 130' INT
 fi
 
+# Persist the token next to the pidfile so a re-arm after a wake can relaunch WITHOUT a fresh
+# radio_join/radio_token round-trip: a wake-exit does NOT unregister the agent and (with grace
+# disabled) the token stays valid, so re-joining every wake is pure churn. The token file's
+# PRESENCE means "token still believed valid" — it is deliberately NOT removed on a normal exit
+# (only on RADIO_DOWN below, when the token is actually dead). The auto-arm hook keys off it:
+# present -> cheap relaunch with this token; absent -> full radio_join.
+TOKEN_FILE=""
+if [ -n "$PIDFILE" ]; then
+  TOKEN_FILE="${PIDFILE%.pid}.token"
+  printf '%s' "$TOKEN" > "$TOKEN_FILE" 2>/dev/null || TOKEN_FILE=""
+fi
+
 while true; do
   out=$("$WAIT" "$HUB" "$TOKEN")
   rc=$?
@@ -101,6 +113,9 @@ while true; do
   # The token is gone - stop and signal so the agent re-fetches it and restarts.
   if [ "$out" = "RADIO_KILLED" ]; then
     printf 'RADIO_DOWN: token rejected (401) or killed - re-fetch token and restart\n' >> "$INBOX"
+    # Token is genuinely dead — drop the cached token so the auto-arm hook does a FULL
+    # radio_join (cheap relaunch would just 401 again).
+    [ -n "$TOKEN_FILE" ] && rm -f "$TOKEN_FILE"
     break
   fi
 
